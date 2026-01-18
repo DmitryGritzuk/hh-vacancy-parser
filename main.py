@@ -11,6 +11,7 @@ API_VACANCIES = "https://api.hh.ru/vacancies"
 
 
 def format_salary(s: Optional[Dict[str, Any]]) -> str:
+    """Красивое форматирование зарплаты из поля salary."""
     if not s:
         return ""
     frm = s.get("from")
@@ -28,14 +29,42 @@ def format_salary(s: Optional[Dict[str, Any]]) -> str:
     return f"{frm}–{to} {cur} ({tax})"
 
 
-def hh_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def hh_get(url: str, params: Optional[Dict[str, Any]] = None, retries: int = 5) -> Dict[str, Any]:
+    """
+    GET к API hh.ru с обработкой лимитов (429) и ретраями.
+    """
     headers = {"User-Agent": "hh-vacancy-parser (learning project)"}
-    r = requests.get(url, params=params, headers=headers, timeout=25)
-    r.raise_for_status()
-    return r.json()
+
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=25)
+
+            # Rate limit
+            if r.status_code == 429:
+                wait = 1.5 * (attempt + 1)
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException as e:
+            last_err = e
+            # небольшой backoff на сетевые/5xx
+            time.sleep(0.8 * (attempt + 1))
+
+    raise requests.HTTPError(f"Request failed after {retries} retries: {last_err}") from last_err
 
 
-def collect_vacancies(text: str, area: Optional[str], pages: int, per_page: int, delay: float) -> List[Dict[str, Any]]:
+def collect_vacancies(
+    text: str,
+    area: Optional[str],
+    pages: int,
+    per_page: int,
+    delay: float,
+) -> List[Dict[str, Any]]:
+    """Собираем вакансии из поиска (items)."""
     items: List[Dict[str, Any]] = []
 
     for page in range(pages):
@@ -56,10 +85,13 @@ def collect_vacancies(text: str, area: Optional[str], pages: int, per_page: int,
 
 
 def enrich_with_details(items: List[Dict[str, Any]], delay: float) -> List[Dict[str, Any]]:
-    """Дотягиваем описание/ключевые навыки/опыт из detail endpoint."""
+    """
+    Дотягиваем детали по каждой вакансии из detail endpoint:
+    опыт / график / занятость / ключевые навыки / description snippet.
+    """
     enriched: List[Dict[str, Any]] = []
 
-    for i, v in enumerate(items, start=1):
+    for v in items:
         url = v.get("url")
         if not url:
             enriched.append(v)
@@ -67,11 +99,19 @@ def enrich_with_details(items: List[Dict[str, Any]], delay: float) -> List[Dict[
 
         try:
             d = hh_get(url)
+
             v["experience_name"] = (d.get("experience") or {}).get("name", "")
             v["schedule_name"] = (d.get("schedule") or {}).get("name", "")
             v["employment_name"] = (d.get("employment") or {}).get("name", "")
-            v["key_skills"] = ", ".join([ks.get("name", "") for ks in (d.get("key_skills") or []) if ks.get("name")])
-            v["description_snippet"] = (d.get("description") or "")
+
+            skills = [ks.get("name", "") for ks in (d.get("key_skills") or []) if ks.get("name")]
+            v["key_skills"] = ", ".join(skills)
+
+            # HH возвращает HTML. Делаем аккуратный короткий snippet.
+            desc = d.get("description") or ""
+            desc = " ".join(desc.split())  # убираем лишние пробелы/переносы
+            v["description_snippet"] = desc[:300]
+
         except requests.RequestException:
             v["experience_name"] = ""
             v["schedule_name"] = ""
@@ -85,14 +125,27 @@ def enrich_with_details(items: List[Dict[str, Any]], delay: float) -> List[Dict[
     return enriched
 
 
-def save_csv(items: List[Dict[str, Any]], path: str, include_details: bool) -> None:
+def save_csv(
+    items: List[Dict[str, Any]],
+    path: str,
+    include_details: bool,
+    query_text: str,
+    area_id: Optional[str],
+    collected_at: str,
+) -> None:
+    """
+    Сохраняем в CSV (utf-8-sig) + добавляем метаданные (запрос/регион/время сборки).
+    """
     base_fields = [
         "name",
         "employer",
         "salary",
         "area",
         "published_at",
-        "url",
+        "hh_url",
+        "query_text",
+        "area_id",
+        "collected_at",
     ]
 
     details_fields = [
@@ -116,7 +169,10 @@ def save_csv(items: List[Dict[str, Any]], path: str, include_details: bool) -> N
                 "salary": format_salary(v.get("salary")),
                 "area": (v.get("area") or {}).get("name", ""),
                 "published_at": v.get("published_at", ""),
-                "url": v.get("alternate_url", ""),
+                "hh_url": v.get("alternate_url", ""),
+                "query_text": query_text,
+                "area_id": area_id or "",
+                "collected_at": collected_at,
             }
 
             if include_details:
@@ -149,12 +205,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
+    query_text = args.text.strip()
+    if not query_text:
+        raise SystemExit("ERROR: --text is empty")
+
     per_page = max(1, min(100, args.per_page))
     pages = max(1, args.pages)
     delay = max(0.0, args.delay)
-    area = args.area.strip() or None
+    area_id = args.area.strip() or None
 
-    items = collect_vacancies(args.text.strip(), area, pages, per_page, delay)
+    collected_at = datetime.now().isoformat(timespec="seconds")
+
+    items = collect_vacancies(query_text, area_id, pages, per_page, delay)
 
     if args.details and items:
         items = enrich_with_details(items, delay=max(0.2, delay))
@@ -167,10 +229,21 @@ def main() -> None:
         else:
             out = out + f"_{ts}.csv"
 
-    save_csv(items, out, include_details=args.details)
+    save_csv(
+        items=items,
+        path=out,
+        include_details=args.details,
+        query_text=query_text,
+        area_id=area_id,
+        collected_at=collected_at,
+    )
 
     print(f"OK: {out}")
     print(f"Vacancies: {len(items)}")
+    if args.details:
+        print("Details: enabled (extra requests per vacancy)")
+    if area_id:
+        print(f"Area: {area_id}")
 
 
 if __name__ == "__main__":
