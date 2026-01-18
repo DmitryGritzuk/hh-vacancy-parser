@@ -9,7 +9,18 @@
 - Опционально: дозагрузка деталей (опыт, график, навыки) по каждой вакансии
 
 ## Установка
+
+```bash
 python -m venv .venv
-source .venv/bin/activate  # mac/linux
+source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 python main.py
+
+
+## Windows (PowerShell)
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main.py
+
