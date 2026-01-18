@@ -9,5 +9,7 @@
 - Опционально: дозагрузка деталей (опыт, график, навыки) по каждой вакансии
 
 ## Установка
-```bash
+python -m venv .venv
+source .venv/bin/activate  # mac/linux
 pip install -r requirements.txt
+python main.py
